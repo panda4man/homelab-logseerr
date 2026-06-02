@@ -10,3 +10,4 @@ dist/
 .worktrees/
 .claude/settings.json
 .mcp.json
+qdrant/

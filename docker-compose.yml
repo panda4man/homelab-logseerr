@@ -2,7 +2,7 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     volumes:
-      - qdrant_data:/qdrant/storage
+      - ./qdrant:/qdrant/storage
     ports:
       - "${QDRANT_HOST_PORT:-6334}:6333"
     restart: unless-stopped
@@ -28,5 +28,3 @@ services:
       - backend
     restart: unless-stopped
 
-volumes:
-  qdrant_data:
