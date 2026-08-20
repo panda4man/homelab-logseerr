@@ -7,7 +7,7 @@ services:
       - "${QDRANT_HOST_PORT:-6334}:6333"
     networks:
       - homelab_stack
-    restart: unless-stopped
+    restart: always
 
   backend:
     build: ./backend
@@ -19,7 +19,7 @@ services:
       - homelab_stack
     depends_on:
       - qdrant
-    restart: unless-stopped
+    restart: always
 
   frontend:
     build:
@@ -32,7 +32,7 @@ services:
       - homelab_stack
     depends_on:
       - backend
-    restart: unless-stopped
+    restart: always
 
 networks:
   homelab_stack:
