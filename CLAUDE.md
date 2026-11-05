@@ -26,8 +26,8 @@ Project instructions for Claude-based coding sessions in this repo.
 ## Notes
 
 - Node version is pinned in `.nvmrc` (`24`).
-- Qdrant is mapped to host `6334` in `docker-compose.yml`.
-- If `/search` returns `Embedding service unavailable`, check `EMBED_URL` and embed service health.
+- `/search` queries Loki live (no vector store or ingestion); Loki retention (7 days) bounds the searchable window.
+- If `/search` returns `Log search unavailable`, check `LOKI_URL` and that Loki is reachable.
 
 
 ## Code Exploration Policy

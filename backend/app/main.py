@@ -1,123 +1,29 @@
 import logging
-import re
-import time
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import httpx
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from qdrant_client import AsyncQdrantClient
 
 from .config import settings
-from .ingestion.chunker import chunk_streams
-from .ingestion.embedder import embed_text
-from .ingestion.indexer import ensure_collection, upsert_chunks
-from .ingestion.loki import fetch_streams
-from .search.aggregator import aggregate_by_service, build_stats_summary, scroll_all_chunks
-from .search.llm import generate_aggregate_answer, generate_answer
-from .search.retriever import search_chunks
+from .search.intent import (  # noqa: F401  (re-exported for callers/tests)
+    QueryIntent,
+    _is_meta_query,
+    _parse_time_filter,
+    parse_intent,
+)
+from .search.llm import generate_answer
+from .search.logql import count_queries, line_queries
+from .search.loki import LogLine, list_containers, query_counts, query_lines
+from .search.reduce import reduce_lines
+from .search.stats import build_stats, render_stats_markdown
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-qdrant = AsyncQdrantClient(url=settings.qdrant_url)
-scheduler = AsyncIOScheduler()
-
-_TIME_PATTERNS: list[tuple[re.Pattern, callable]] = [
-    (re.compile(r"last\s+(\d+)\s+hours?", re.I), lambda m: timedelta(hours=int(m.group(1)))),
-    (re.compile(r"last\s+(\d+)\s+days?", re.I), lambda m: timedelta(days=int(m.group(1)))),
-    (re.compile(r"last\s+(\d+)\s+weeks?", re.I), lambda m: timedelta(weeks=int(m.group(1)))),
-    (re.compile(r"last\s+24\s+hours?", re.I), lambda _: timedelta(hours=24)),
-    (re.compile(r"last\s+hour", re.I), lambda _: timedelta(hours=1)),
-    (re.compile(r"last\s+week", re.I), lambda _: timedelta(weeks=1)),
-    (re.compile(r"\btoday\b", re.I), lambda _: timedelta(hours=24)),
-    (re.compile(r"\byesterday\b", re.I), lambda _: timedelta(hours=48)),
-]
-
-
-def _parse_time_filter(query: str) -> datetime | None:
-    for pattern, delta_fn in _TIME_PATTERNS:
-        m = pattern.search(query)
-        if m:
-            return datetime.now(tz=timezone.utc) - delta_fn(m)
-    return None
-
-
-_META_PATTERNS: list[re.Pattern] = [
-    re.compile(r"how many", re.I),
-    re.compile(r"how much", re.I),
-    re.compile(r"number of", re.I),
-    re.compile(r"\bcount\b", re.I),
-    re.compile(r"which (container|service|app)", re.I),
-    re.compile(r"what (container|service|app)", re.I),
-    re.compile(r"most (errors?|warnings?)", re.I),
-    re.compile(r"\bdistinct\b", re.I),
-    re.compile(r"across all", re.I),
-    re.compile(r"list (the |all )?(containers|services|apps)", re.I),
-]
-
-
-def _is_meta_query(query: str) -> bool:
-    return any(pattern.search(query) for pattern in _META_PATTERNS)
-
-
-async def run_ingestion() -> None:
-    logger.info("Ingestion run starting")
-    now_ns = time.time_ns()
-    lookback_ns = settings.ingest_interval_minutes * 60 * 1_000_000_000 * 2
-
-    try:
-        streams = await fetch_streams(
-            loki_url=settings.loki_url,
-            start_ns=now_ns - lookback_ns,
-            end_ns=now_ns,
-            page_limit=settings.loki_page_limit,
-            max_pages=settings.loki_max_pages,
-        )
-    except Exception:
-        logger.exception("Failed to fetch from Loki — skipping run")
-        return
-
-    chunks = chunk_streams(streams)
-    if not chunks:
-        logger.info("No log chunks to index")
-        return
-
-    vectors, valid_chunks = [], []
-    for chunk in chunks:
-        try:
-            vector = await embed_text(
-                settings.embed_url, settings.embed_model, chunk.embedding_text
-            )
-            vectors.append(vector)
-            valid_chunks.append(chunk)
-        except Exception:
-            logger.exception("Embed failed for %s/%s — skipping", chunk.service, chunk.start_time)
-
-    if not valid_chunks:
-        return
-
-    await ensure_collection(qdrant, settings.collection_name, len(vectors[0]))
-    await upsert_chunks(qdrant, settings.collection_name, valid_chunks, vectors)
-    logger.info("Ingestion complete: %d chunks indexed", len(valid_chunks))
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    scheduler.add_job(
-        run_ingestion, "interval", minutes=settings.ingest_interval_minutes, id="ingestion"
-    )
-    scheduler.start()
-    yield
-    scheduler.shutdown()
-
-
-app = FastAPI(title="logseerr", lifespan=lifespan)
+app = FastAPI(title="logseerr")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -136,102 +42,150 @@ class SearchResponse(BaseModel):
     sources: list[dict]
 
 
+def _loki_unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail="Log search unavailable")
+
+
 @app.get("/health")
 async def health():
     checks: dict[str, str] = {}
-
-    # Qdrant
-    try:
-        await qdrant.get_collections()
-        checks["qdrant"] = "ok"
-    except Exception:
-        checks["qdrant"] = "unavailable"
-
-    # Embed server (Ollama embeddings instance)
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{settings.embed_url}/api/tags", timeout=5)
-            resp.raise_for_status()
-        checks["embed"] = "ok"
-    except Exception:
-        checks["embed"] = "unavailable"
-
-    # LLM server (Ollama)
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{settings.ollama_url}/api/tags", timeout=5)
-            resp.raise_for_status()
-        checks["llm"] = "ok"
-    except Exception:
-        checks["llm"] = "unavailable"
+    for name, url in (
+        ("loki", f"{settings.loki_url}/loki/api/v1/labels"),
+        ("llm", f"{settings.ollama_url}/api/tags"),
+    ):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=5)
+                resp.raise_for_status()
+            checks[name] = "ok"
+        except Exception:
+            checks[name] = "unavailable"
 
     all_ok = all(v == "ok" for v in checks.values())
-    status_code = 200 if all_ok else 503
-    return JSONResponse(content={"status": "ok" if all_ok else "degraded", **checks}, status_code=status_code)
+    return JSONResponse(
+        content={"status": "ok" if all_ok else "degraded", **checks},
+        status_code=200 if all_ok else 503,
+    )
 
 
-@app.post("/ingest", status_code=202)
-async def ingest():
-    import asyncio
-    asyncio.create_task(run_ingestion())
-    return {"status": "ingestion started"}
+def _ns(dt: datetime) -> int:
+    return int(dt.timestamp() * 1_000_000_000)
+
+
+def _describe_scope(
+    containers: list[str], since: datetime, severity: str, note: str = ""
+) -> str:
+    names = ", ".join(containers) if containers else "all"
+    sev = severity + (f" ({note})" if note else "")
+    return f"containers=[{names}], window=since {since:%Y-%m-%d %H:%M} UTC, severity={sev}"
 
 
 @app.post("/search", response_model=SearchResponse)
 async def search(req: SearchRequest):
-    if _is_meta_query(req.query):
-        return await _search_aggregate(req.query)
+    now = datetime.now(tz=timezone.utc)
+    retention_start = now - timedelta(days=settings.loki_retention_days)
 
     try:
-        query_vector = await embed_text(settings.embed_url, settings.embed_model, req.query)
+        known = await list_containers(settings.loki_url, _ns(retention_start), _ns(now))
     except Exception:
-        raise HTTPException(status_code=503, detail="Embedding service unavailable")
+        logger.exception("Loki label lookup failed")
+        raise _loki_unavailable()
 
-    since = _parse_time_filter(req.query)
+    intent = await parse_intent(
+        req.query,
+        known,
+        settings.ollama_url,
+        settings.ollama_model,
+        num_ctx=settings.ollama_num_ctx,
+        default_hours=settings.search_default_hours,
+        retention_days=settings.loki_retention_days,
+        now=now,
+    )
 
+    if intent.mode == "stats":
+        return await _search_stats(req.query, intent, now)
+    return await _search_logs(req.query, intent, now)
+
+
+async def _search_stats(query: str, intent: QueryIntent, now: datetime) -> SearchResponse:
+    range_seconds = max(int((now - intent.since).total_seconds()), 1)
+    q1, q2 = count_queries(intent.containers, intent.keywords, range_seconds)
     try:
-        sources = await search_chunks(
-            qdrant,
-            settings.collection_name,
-            query_vector,
-            since=since,
-            top_k=settings.search_top_k,
-            min_score=settings.search_min_score or None,
-        )
+        q1_rows = await query_counts(settings.loki_url, q1, _ns(now))
+        q2_rows = await query_counts(settings.loki_url, q2, _ns(now))
     except Exception:
-        raise HTTPException(status_code=503, detail="Vector search unavailable")
+        logger.exception("Loki count query failed")
+        raise _loki_unavailable()
 
-    if not sources:
+    if not q1_rows:
         return SearchResponse(answer=None, answer_status="no_results", sources=[])
 
-    answer = await generate_answer(settings.ollama_url, settings.ollama_model, req.query, sources)
+    per_container = build_stats(q1_rows, q2_rows)
+    answer = render_stats_markdown(per_container, intent.since, intent.keywords)
+    return SearchResponse(answer=answer, answer_status="ok", sources=[])
+
+
+async def _fetch_lines(
+    intent: QueryIntent, severity: str, keywords: list[str], now: datetime
+) -> list[LogLine]:
+    merged: list[LogLine] = []
+    for logql in line_queries(intent.containers, severity, keywords):
+        merged.extend(
+            await query_lines(
+                settings.loki_url, logql, _ns(intent.since), _ns(now), settings.loki_query_limit
+            )
+        )
+    return merged
+
+
+async def _search_logs(query: str, intent: QueryIntent, now: datetime) -> SearchResponse:
+    attempts: list[tuple[str, list[str], str]] = [(intent.severity, intent.keywords, "")]
+    if intent.keywords:
+        attempts.append((intent.severity, [], "keyword filter dropped; no lines matched it"))
+    if intent.severity in ("errors", "warnings"):
+        attempts.append(
+            (
+                "all",
+                [],
+                f"no {'error-level' if intent.severity == 'errors' else 'warning or error'} "
+                "lines matched; showing other recent lines",
+            )
+        )
+
+    lines: list[LogLine] = []
+    used: tuple[str, list[str], str] = attempts[0]
+    try:
+        for attempt in attempts:
+            lines = await _fetch_lines(intent, attempt[0], attempt[1], now)
+            used = attempt
+            if lines:
+                break
+    except Exception:
+        logger.exception("Loki line query failed")
+        raise _loki_unavailable()
+
+    if not lines:
+        return SearchResponse(answer=None, answer_status="no_results", sources=[])
+
+    sources, stats = reduce_lines(
+        lines,
+        max_lines=settings.search_max_lines,
+        max_chars=settings.search_max_context_chars,
+        max_line_chars=settings.search_max_line_chars,
+    )
+    severity, keywords, note = used
+    scope = _describe_scope(intent.containers, intent.since, severity, note)
+    if keywords:
+        scope += f", keywords=[{', '.join(keywords)}]"
+    if stats.truncated:
+        scope += f". Showing {stats.shown_lines} of {stats.total_lines} lines"
+
+    answer = await generate_answer(
+        settings.ollama_url, settings.ollama_model, query, sources, scope,
+        num_ctx=settings.ollama_num_ctx,
+        severity=severity,
+        fell_back=bool(note),
+    )
     if answer is None:
         return SearchResponse(answer=None, answer_status="llm_unavailable", sources=sources)
     return SearchResponse(answer=answer, answer_status="ok", sources=sources)
-
-
-async def _search_aggregate(query: str) -> SearchResponse:
-    """Answer a meta-question with deterministic stats over the whole corpus."""
-    since = _parse_time_filter(query)
-
-    try:
-        chunks, truncated = await scroll_all_chunks(
-            qdrant,
-            settings.collection_name,
-            since=since,
-            max_chunks=settings.aggregate_max_chunks,
-        )
-    except Exception:
-        raise HTTPException(status_code=503, detail="Vector search unavailable")
-
-    if not chunks:
-        return SearchResponse(answer=None, answer_status="no_results", sources=[])
-
-    per_service = aggregate_by_service(chunks)
-    stats = build_stats_summary(per_service, since, truncated)
-    answer = await generate_aggregate_answer(
-        settings.ollama_url, settings.ollama_model, query, stats
-    )
-    if answer is None:
-        return SearchResponse(answer=None, answer_status="llm_unavailable", sources=[])
-    return SearchResponse(answer=answer, answer_status="ok", sources=[])

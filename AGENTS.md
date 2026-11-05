@@ -4,7 +4,7 @@ Guidance for coding agents working in this repository.
 
 ## Repository shape
 
-- `backend/` — FastAPI app, ingestion, retrieval, tests
+- `backend/` — FastAPI app, Loki query/intent/reduce search pipeline, tests
 - `frontend/` — Vue 3 + Vite UI
 - `docker-compose.yml` — local full-stack runtime
 

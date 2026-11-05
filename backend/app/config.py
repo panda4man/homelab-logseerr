@@ -12,18 +12,15 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     loki_url: str = "http://localhost:3100"
-    embed_url: str = "http://localhost:8080"
-    embed_model: str = "nomic-embed-text"
-    qdrant_url: str = "http://localhost:6333"
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "llama3"
-    ingest_interval_minutes: int = 15
-    collection_name: str = "logseerr"
-    search_top_k: int = 10
-    search_min_score: float = 0.0
-    aggregate_max_chunks: int = 10000
-    loki_page_limit: int = 5000
-    loki_max_pages: int = 50
+    ollama_num_ctx: int = 8192
+    loki_retention_days: int = 7
+    search_default_hours: int = 24
+    loki_query_limit: int = 1000
+    search_max_lines: int = 200
+    search_max_context_chars: int = 16000
+    search_max_line_chars: int = 500
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
