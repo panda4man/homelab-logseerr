@@ -75,9 +75,9 @@ const CAPTION_CYCLE_MS = 1500
 const CENTER_EXCLUSION_R = 36
 
 const stages = [
-  'Embedding query…',
-  'Searching vector space…',
-  'Ranking nearest matches…',
+  'Understanding question…',
+  'Querying Loki…',
+  'Condensing log lines…',
   'Asking LLM…',
 ]
 

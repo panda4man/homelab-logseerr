@@ -1,10 +1,12 @@
 # logseerr
 
-`logseerr` is a local log-search assistant: it ingests logs, stores embeddings in Qdrant, and answers natural-language questions through a FastAPI backend and Vue frontend.
+`logseerr` is a local log-search assistant. It answers natural-language questions about your homelab logs by querying Loki live (Loki is the only log store; nothing is copied or embedded) and summarising the matching lines with an Ollama LLM, through a FastAPI backend and Vue frontend.
+
+Searches are limited to the last 7 days because that is Loki's retention.
 
 ## Stack
 
-- **Backend:** FastAPI + APScheduler + Qdrant client (`backend/`)
+- **Backend:** FastAPI + httpx, querying Loki via LogQL (`backend/`)
 - **Frontend:** Vue 3 + Vite + Tailwind (`frontend/`)
 - **Infra:** Docker Compose (`docker-compose.yml`)
 
@@ -25,14 +27,14 @@ cp .env.example .env
 2. Edit `.env` with reachable service URLs:
 
 - `LOKI_URL`
-- `EMBED_URL` — Ollama embeddings instance (serves OpenAI-compatible `/v1/embeddings`)
-- `OLLAMA_URL` — Ollama LLM instance (serves `/api/generate` for RAG)
+- `OLLAMA_URL` — Ollama instance (serves `/api/generate` for query understanding and answers)
+- `OLLAMA_MODEL`
 - `VITE_API_BASE_URL`
 
-> **Dual-Ollama setup:** The project uses two separate Ollama instances — one
-> dedicated to embeddings (port `11435`) and one for LLM generation (port
-> `11434`). This keeps embedding workloads isolated from inference. Both run on
-> the same unraid host (`192.168.50.46`) but could be split across machines.
+> **Ollama:** one Ollama instance (the Mac mini, `192.168.50.121`) serves both
+> LLM calls: turning the question into a structured Loki query, and writing the
+> final answer. It must listen on the LAN (`OLLAMA_HOST=0.0.0.0`) and should
+> have a stable IP (DHCP reservation). No embedding service is needed.
 
 3. Build and run:
 
@@ -53,7 +55,7 @@ curl -X POST http://localhost:8000/search \
 Notes:
 - Frontend is served at `http://localhost`
 - Backend is served at `http://localhost:8000`
-- Qdrant is exposed on host port `6334` (`6334 -> 6333` in container)
+- Log data stays in Loki; logseerr keeps no database of its own
 
 ## Local development
 
@@ -92,13 +94,13 @@ npm run build
 
 ## API
 
-- `GET /health` → checks connectivity to Qdrant, embed server, and LLM:
+- `GET /health` → checks connectivity to Loki (`/loki/api/v1/labels`) and the Ollama LLM:
 
 ```json
-{ "status": "ok", "qdrant": "ok", "embed": "ok", "llm": "ok" }
+{ "status": "ok", "loki": "ok", "llm": "ok" }
 ```
 
-Returns `503` with `"status": "degraded"` if any service is unreachable.
+Returns `503` with `"status": "degraded"` if either service is unreachable.
 - `POST /search` with JSON body:
 
 ```json
@@ -110,8 +112,11 @@ Response:
 ```json
 {
   "answer": "string | null",
+  "answer_status": "ok | no_results | llm_unavailable",
   "sources": []
 }
 ```
 
-If embeddings are unavailable, `/search` returns `503` with `Embedding service unavailable`.
+For count/"which container" questions the counts are always computed directly from Loki and rendered as deterministic markdown without the LLM (no sources).
+
+If Loki is unreachable, `/search` returns `503` with `Log search unavailable`.

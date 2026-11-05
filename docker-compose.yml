@@ -1,14 +1,4 @@
 services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    volumes:
-      - ./qdrant:/qdrant/storage
-    ports:
-      - "${QDRANT_HOST_PORT:-6334}:6333"
-    networks:
-      - homelab_stack
-    restart: always
-
   backend:
     build: ./backend
     ports:
@@ -17,8 +7,6 @@ services:
       - .env
     networks:
       - homelab_stack
-    depends_on:
-      - qdrant
     restart: always
 
   frontend:

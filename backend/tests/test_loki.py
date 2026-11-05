@@ -1,156 +1,94 @@
+import httpx
 import pytest
 import respx
-import httpx
-from app.ingestion.loki import fetch_streams, LokiStream
 
-LOKI_URL = "http://loki:3100"
+from app.search.loki import LogLine, list_containers, query_counts, query_lines
 
-SAMPLE_RESPONSE = {
-    "status": "success",
-    "data": {
-        "resultType": "streams",
-        "result": [
-            {
-                "stream": {"job": "plex"},
-                "values": [
-                    ["1716768000000000000", "stream started"],
-                    ["1716768060000000000", "buffering error"],
-                ],
-            },
-            {
-                "stream": {"job": "sonarr"},
-                "values": [["1716768120000000000", "episode downloaded"]],
-            },
-        ],
-    },
-}
+LOKI = "http://loki:3100"
 
 
 @respx.mock
-async def test_fetch_streams_returns_streams():
-    respx.get(f"{LOKI_URL}/loki/api/v1/query_range").mock(
-        return_value=httpx.Response(200, json=SAMPLE_RESPONSE)
+async def test_list_containers():
+    route = respx.get(f"{LOKI}/loki/api/v1/label/container/values").mock(
+        return_value=httpx.Response(200, json={"status": "success", "data": ["plex", "sonarr"]})
     )
-    streams = await fetch_streams(LOKI_URL, start_ns=0, end_ns=9999999999999999999)
-    assert len(streams) == 2
-    assert streams[0].service == "plex"
-    assert len(streams[0].values) == 2
-    assert streams[0].values[0] == (1716768000000000000, "stream started")
-    assert streams[1].service == "sonarr"
+    assert await list_containers(LOKI, 1, 2) == ["plex", "sonarr"]
+    assert route.calls[0].request.url.params["start"] == "1"
 
 
 @respx.mock
-async def test_fetch_streams_uses_app_label_fallback():
-    response = {
-        "status": "success",
-        "data": {
-            "resultType": "streams",
-            "result": [
-                {
-                    "stream": {"app": "myapp"},
-                    "values": [["1716768000000000000", "log line"]],
-                }
-            ],
-        },
-    }
-    respx.get(f"{LOKI_URL}/loki/api/v1/query_range").mock(
-        return_value=httpx.Response(200, json=response)
+async def test_list_containers_missing_data():
+    respx.get(f"{LOKI}/loki/api/v1/label/container/values").mock(
+        return_value=httpx.Response(200, json={"status": "success"})
     )
-    streams = await fetch_streams(LOKI_URL, start_ns=0, end_ns=9999)
-    assert streams[0].service == "myapp"
+    assert await list_containers(LOKI, 1, 2) == []
 
 
 @respx.mock
-async def test_fetch_streams_raises_on_http_error():
-    respx.get(f"{LOKI_URL}/loki/api/v1/query_range").mock(
-        return_value=httpx.Response(500)
-    )
+async def test_list_containers_http_error_propagates():
+    respx.get(f"{LOKI}/loki/api/v1/label/container/values").mock(return_value=httpx.Response(500))
     with pytest.raises(httpx.HTTPStatusError):
-        await fetch_streams(LOKI_URL, start_ns=0, end_ns=9999)
+        await list_containers(LOKI, 1, 2)
 
 
 @respx.mock
-async def test_lokistream_carries_labels():
-    response = {
-        "status": "success",
-        "data": {
-            "resultType": "streams",
-            "result": [
-                {
-                    "stream": {"job": "plex", "level": "error", "container": "plex"},
-                    "values": [["1000", "oops"]],
-                }
-            ],
-        },
-    }
-    respx.get(f"{LOKI_URL}/loki/api/v1/query_range").mock(
-        return_value=httpx.Response(200, json=response)
-    )
-    streams = await fetch_streams(LOKI_URL, start_ns=0, end_ns=9999)
-    assert streams[0].labels == {"job": "plex", "level": "error", "container": "plex"}
-
-
-@respx.mock
-async def test_fetch_streams_paginates_until_short_page():
-    page1 = {
-        "status": "success",
-        "data": {
-            "resultType": "streams",
-            "result": [
-                {"stream": {"job": "plex"}, "values": [["1000", "a"], ["2000", "b"]]}
-            ],
-        },
-    }
-    page2 = {
-        "status": "success",
-        "data": {
-            "resultType": "streams",
-            "result": [
-                {"stream": {"job": "plex"}, "values": [["3000", "c"]]}
-            ],
-        },
-    }
-    route = respx.get(f"{LOKI_URL}/loki/api/v1/query_range").mock(
-        side_effect=[
-            httpx.Response(200, json=page1),
-            httpx.Response(200, json=page2),
-        ]
-    )
-    streams = await fetch_streams(
-        LOKI_URL, start_ns=0, end_ns=9999, page_limit=2
-    )
-    assert route.call_count == 2
-    assert len(streams) == 1
-    assert streams[0].service == "plex"
-    assert [v[0] for v in streams[0].values] == [1000, 2000, 3000]
-
-
-@respx.mock
-async def test_fetch_streams_respects_max_pages():
-    # Each call returns a full page with a fresh, advancing ts so the loop
-    # would keep going indefinitely. max_pages must cap it.
-    pages = [
-        {
-            "status": "success",
-            "data": {
-                "resultType": "streams",
-                "result": [
-                    {
-                        "stream": {"job": "plex"},
-                        "values": [
-                            [str(base + 0), "a"],
-                            [str(base + 100), "b"],
-                        ],
-                    }
-                ],
+async def test_query_lines_parses_streams():
+    route = respx.get(f"{LOKI}/loki/api/v1/query_range").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "resultType": "streams",
+                    "result": [
+                        {"stream": {"container": "plex", "level": "ERROR"}, "values": [["100", "boom"], ["99", "b2"]]},
+                        {"stream": {"container": "authentik"}, "values": [["50", "hi"]]},
+                    ],
+                },
             },
-        }
-        for base in (1000, 3000, 5000, 7000, 9000)
-    ]
-    route = respx.get(f"{LOKI_URL}/loki/api/v1/query_range").mock(
-        side_effect=[httpx.Response(200, json=p) for p in pages]
+        )
     )
-    await fetch_streams(
-        LOKI_URL, start_ns=0, end_ns=99999, page_limit=2, max_pages=3
+    lines = await query_lines(LOKI, "{container!=\"\"}", 1, 200, 1000)
+    assert lines[0] == LogLine("plex", "error", 100, "boom")
+    assert lines[2] == LogLine("authentik", "", 50, "hi")
+    params = route.calls[0].request.url.params
+    assert params["direction"] == "backward"
+    assert params["limit"] == "1000"
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_query_lines_missing_data():
+    respx.get(f"{LOKI}/loki/api/v1/query_range").mock(
+        return_value=httpx.Response(200, json={"status": "success"})
     )
-    assert route.call_count == 3
+    assert await query_lines(LOKI, "q", 1, 2, 10) == []
+
+
+@respx.mock
+async def test_query_counts_parses_floats_and_empty_metric():
+    respx.get(f"{LOKI}/loki/api/v1/query").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "resultType": "vector",
+                    "result": [
+                        {"metric": {"container": "plex", "level": "error"}, "value": [1, "12"]},
+                        {"metric": {}, "value": [1, "3.0"]},
+                    ],
+                },
+            },
+        )
+    )
+    rows = await query_counts(LOKI, "q", 5)
+    assert rows == [({"container": "plex", "level": "error"}, 12), ({}, 3)]
+
+
+@respx.mock
+async def test_query_counts_missing_data():
+    respx.get(f"{LOKI}/loki/api/v1/query").mock(
+        return_value=httpx.Response(200, json={"status": "success"})
+    )
+    assert await query_counts(LOKI, "q", 5) == []
